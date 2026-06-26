@@ -1,15 +1,16 @@
 """
 封装 Kriging 的常用函数：OK 插值、LOO OK、对点或网格做 residual kriging。
 
-注意：
-- 请确保传入的 station_x/station_y 是在同一线性度量下（比如已投影为米），
-  因为 variogram/距离以欧氏距离计算，使用经纬度（degrees）会导致不合理的变异函数。
-- pykrige 的 grid 输出形状通常是 (len(grid_y), len(grid_x))，与 meshgrid 的 ordering 相关。
+扩展说明：
+ - perform_ok_loo 新增参数:
+     neighbors: int or None，LOO 时对每个待预测点仅使用最近 neighbors 个训练点来拟合变异函数（加速/稳定）
+     use_cache: bool, cache_path: str, overwrite: bool 用于缓存 LOO 结果 (np.savez)
 """
-
 import warnings
 import numpy as np
 from pykrige.ok import OrdinaryKriging
+from scipy.spatial import cKDTree
+import os
 
 
 def perform_ok_interpolation(station_x, station_y, station_z, grid_res=50, variogram_model='spherical'):
@@ -36,7 +37,6 @@ def perform_ok_interpolation(station_x, station_y, station_z, grid_res=50, vario
             verbose=False,
             enable_plotting=False
         )
-        # pykrige execute('grid', xs, ys) -> returns array shaped (len(ys), len(xs))
         ok_grid, ss = ok.execute('grid', grid_x, grid_y)
         ok_grid = np.asarray(ok_grid)
         ok_grid = np.nan_to_num(ok_grid, nan=np.nanmean(station_z))
@@ -47,12 +47,15 @@ def perform_ok_interpolation(station_x, station_y, station_z, grid_res=50, vario
     return grid_xx, grid_yy, ok_grid
 
 
-def perform_ok_loo(station_x, station_y, station_z, variogram_model='spherical'):
+def perform_ok_loo(station_x, station_y, station_z,
+                   variogram_model='spherical',
+                   neighbors=None,
+                   use_cache=False, cache_path='ok_loo.npz', overwrite=False):
     """
     Leave-one-out Ordinary Kriging predictions at the station points.
-    Returns a numpy array of predictions (same length as inputs). If a point
-    cannot be predicted, the corresponding value will be np.nan.
-    For very small n (<=3) we fallback to returning np.full(n, np.nan).
+    - neighbors: 如果为 int，则对每个 LOO 拟合仅使用该点的最近 neighbors 个训练点（若 neighbors >= n-1 则使用所有）。
+    - use_cache: 如果 True，会尝试读取/写入 cache_path。cache 保存字段 'ok_loo' (numpy array)。
+    返回 numpy array (len == n)，缺失处为 np.nan。
     """
     station_x = np.asarray(station_x)
     station_y = np.asarray(station_y)
@@ -65,15 +68,40 @@ def perform_ok_loo(station_x, station_y, station_z, variogram_model='spherical')
         warnings.warn("perform_ok_loo: too few stations (<=3), returning NaNs for LOO predictions.")
         return np.full(n, np.nan)
 
-    preds = np.full(n, np.nan)
+    # try cache
+    if use_cache and os.path.exists(cache_path) and not overwrite:
+        try:
+            data = np.load(cache_path, allow_pickle=True)
+            ok_loo = data.get('ok_loo', None)
+            if ok_loo is not None and len(ok_loo) == n:
+                return ok_loo
+        except Exception:
+            pass
 
-    # loop LOO (pykrige requires rebuild per LOO)
+    preds = np.full(n, np.nan)
+    pts = np.column_stack([station_x, station_y])
+    tree = cKDTree(pts)
+
     for i in range(n):
         try:
-            mask = np.ones(n, dtype=bool)
-            mask[i] = False
+            # select neighbor indices (exclude i)
+            if neighbors is None:
+                mask = np.ones(n, dtype=bool)
+                mask[i] = False
+                idxs = np.nonzero(mask)[0]
+            else:
+                # k nearest including self
+                k = min(max(1, int(neighbors) + 1), n)  # +1 to include self
+                dists, inds = tree.query(pts[i], k=k)
+                inds = np.atleast_1d(inds)
+                # remove self from inds
+                idxs = [int(j) for j in inds if int(j) != i]
+                if len(idxs) == 0:
+                    preds[i] = np.nan
+                    continue
+
             ok = OrdinaryKriging(
-                station_x[mask], station_y[mask], station_z[mask],
+                station_x[idxs], station_y[idxs], station_z[idxs],
                 variogram_model=variogram_model,
                 verbose=False,
                 enable_plotting=False
@@ -82,6 +110,13 @@ def perform_ok_loo(station_x, station_y, station_z, variogram_model='spherical')
             preds[i] = float(p[0])
         except Exception:
             preds[i] = np.nan
+
+    # write cache if requested
+    if use_cache:
+        try:
+            np.savez_compressed(cache_path, ok_loo=preds)
+        except Exception:
+            pass
 
     return preds
 
