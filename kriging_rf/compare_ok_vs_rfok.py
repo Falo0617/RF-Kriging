@@ -115,7 +115,6 @@ def compare_ok_vs_rfok(df_xy, ok_preds, rfok_preds, out_prefix='compare_ok_rfok'
 
         # scatter map of which stations improved
         try:
-            import numpy as _np
             coords = np.column_stack([df_out['x'], df_out['y']])
             improved = (df_out['abs_err_diff'] < 0)
             plt.figure(figsize=(6,5))
@@ -129,3 +128,50 @@ def compare_ok_vs_rfok(df_xy, ok_preds, rfok_preds, out_prefix='compare_ok_rfok'
             pass
 
     return summary, df_out, (stat, pval, (lo, med, hi))
+
+
+def compare_and_plot(*args, **kwargs):
+    """
+    向后兼容 wrapper。
+    支持两种常见调用方式：
+      1) compare_and_plot(df_xy, ok_preds, rfok_preds, out_prefix=...)
+      2) compare_and_plot(ok_preds, df_preds, out_prefix=...)  # run_kriging.py 常用形式
+    在第二种情况下，df_preds 需要包含至少 ['x','y','temperature'] 以及 'oof_corr' 或 'oof_rf' 中的一个。
+    """
+    out_prefix = kwargs.pop('out_prefix', 'compare_ok_rfok')
+    save_plots = kwargs.pop('save_plots', True)
+
+    # detect signature
+    if len(args) >= 3 and isinstance(args[0], (list, tuple, __import__('numpy').ndarray)) is False:
+        # Likely signature (df_xy, ok_preds, rfok_preds)
+        return compare_ok_vs_rfok(*args, out_prefix=out_prefix, save_plots=save_plots)
+    # else handle (ok_preds, df_preds)
+    if len(args) >= 2:
+        ok_preds = args[0]
+        df_preds = args[1]
+        # df_preds could be DataFrame or dict-like
+        if not hasattr(df_preds, 'columns'):
+            raise ValueError("compare_and_plot: df_preds must be a pandas DataFrame-like with columns ['x','y','temperature','oof_corr'|'oof_rf'].")
+        df_xy = df_preds.copy()
+        # ensure x,y columns exist; if not try to make x,y from lon/lat via features.stations_to_xy (caller should already have)
+        if 'x' not in df_xy.columns or 'y' not in df_xy.columns:
+            # try to derive x/y if lat/lon exist (best-effort)
+            if 'lon' in df_xy.columns and 'lat' in df_xy.columns:
+                from .features import stations_to_xy
+                df_xy2, _, _ = stations_to_xy(df_xy)
+                df_xy = df_xy2
+            else:
+                raise KeyError("compare_and_plot: df_preds lacks 'x'/'y' and no 'lon'/'lat' to derive them.")
+
+        # pick rf predictions
+        if 'oof_corr' in df_xy.columns:
+            rfok_preds = df_xy['oof_corr'].values
+        elif 'oof_rf' in df_xy.columns:
+            rfok_preds = df_xy['oof_rf'].values
+        else:
+            raise KeyError("compare_and_plot: df_preds must contain 'oof_corr' or 'oof_rf' column.")
+
+        # ok_preds may be full-length or aligned; call compare_ok_vs_rfok
+        return compare_ok_vs_rfok(df_xy, ok_preds, rfok_preds, out_prefix=out_prefix, save_plots=save_plots)
+
+    raise ValueError("compare_and_plot: unsupported argument signature.")
