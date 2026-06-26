@@ -17,19 +17,19 @@ except Exception:
 
 def parse_args():
     p = argparse.ArgumentParser(description="Run RF + Kriging residual pipeline using Guangdong parquet cache")
-    p.add_argument('--cache', type=str, default='guangdong_merged_cache.parquet',
+    p.add_argument('--cache', type=str, default='gsod_merged_cache.parquet',
                    help='预处理后的 parquet 文件（完整路径或相对于当前工作目录/脚本的路径）')
     p.add_argument('--cache-only', action='store_true', default=True,
                    help='仅从 parquet 缓存读取并退出（若找不到文件则退出）')
     p.add_argument('--lat', type=float, default=23.00)
     p.add_argument('--lon', type=float, default=113.00)
-    p.add_argument('--radius', type=float, default=1000000.0)
+    p.add_argument('--radius', type=float, default=1000.0)
     p.add_argument('--max-stations', type=int, default=20)
-    p.add_argument('--grid-res', type=int, default=50)
-    p.add_argument('--n-splits', type=int, default=50)
+    p.add_argument('--grid-res', type=int, default=10)
+    p.add_argument('--n-splits', type=int, default=5)
     p.add_argument('--out-prefix', type=str, default='rfok')
     # neighbors 参数传给 kriging_utils.perform_ok_loo
-    p.add_argument('--ok-neighbors', type=int, default=30, help='OK-LOO 时使用的邻域大小 k（最近 k 个邻居）')
+    p.add_argument('--ok-neighbors', type=int, default=10, help='OK-LOO 时使用的邻域大小 k（最近 k 个邻居）')
     p.add_argument('--ok-cache', type=str, default='ok_loo.npz', help='OK-LOO 结果缓存路径')
     p.add_argument('--no-compare', dest='do_compare', action='store_false', help='禁用 OK vs RF-Kriging 比较')
     p.set_defaults(do_compare=True)

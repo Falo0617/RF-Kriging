@@ -13,8 +13,21 @@ import os
 import sys
 import pandas as pd
 import numpy as np
+import glob
 
 SENTINEL_VALUES = {999017, 999999, 99999, 9999}
+
+def auto_find_input(data_dir='Guangzhou_data'):
+    """在 data_dir 下按优先级寻找 parquet 然后 csv"""
+    if not os.path.isdir(data_dir):
+        return None
+    # 优先 parquet
+    pats = ['*.parquet', '*.parq', '*.pq', '*.parquet.gz', '*.csv', '*.txt']
+    for p in pats:
+        full = glob.glob(os.path.join(data_dir, p))
+        if full:
+            return full[0]
+    return None
 
 def find_col(df, candidates):
     """在 df 中查找第一匹配的列名（大小写不敏感）。返回列名或 None"""
@@ -31,10 +44,8 @@ def sanitize_temp(x):
         xv = float(x)
         if int(xv) in SENTINEL_VALUES:
             return np.nan
-        # 如果温度绝对值极大，视为异常（单位通常是 °C，允许 -60..60）
         if xv < -60 or xv > 60:
             return np.nan
-        # 某些数据是放大 10 倍的情况（极端少见），但这里不自动调整，留给人工检查
         return xv
     except Exception:
         return np.nan
@@ -46,7 +57,7 @@ def sanitize_elev(x):
         xv = float(x)
         if int(xv) in SENTINEL_VALUES:
             return np.nan
-        if xv < -500 or xv > 10000:  # 海拔范围阈值
+        if xv < -500 or xv > 10000:
             return np.nan
         return xv
     except Exception:
@@ -62,7 +73,6 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     col_name = find_col(df, ['name', 'station_name', 'stn_name'])
 
     if col_station is None:
-        # 如果没有 station id，尝试用经纬+name组合成 id
         df['_tmp_idx'] = df.index.astype(str)
         col_station = '_tmp_idx'
         print("Warning: station id not found; using row index as station_id (temporary).")
@@ -70,7 +80,6 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     if col_lat is None or col_lon is None:
         raise ValueError("Latitude/Longitude columns not found. Found columns: " + ", ".join(df.columns))
 
-    # 先拷贝需要的列到标准名（降低后续模块出错概率）
     df2 = pd.DataFrame()
     df2['station_id'] = df[col_station].astype(str)
     df2['lat'] = pd.to_numeric(df[col_lat], errors='coerce')
@@ -91,48 +100,52 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df2['name'] = df2['station_id']
 
-    # 去掉经纬缺失的行
     df2 = df2.dropna(subset=['lat','lon']).reset_index(drop=True)
 
-    # 聚合：按 station_id （同时保留 lat/lon 的中位/平均，如果同一 id 有不同经纬会用中位）
     agg_funcs = {
         'lat': 'median',
         'lon': 'median',
         'elevation': lambda x: np.nanmedian(x.values) if np.any(~np.isnan(x.values)) else np.nan,
         'temperature': lambda x: np.nanmean(x.values) if np.any(~np.isnan(x.values)) else np.nan,
-        'temperature_raw': 'count',  # 用来计算 data_count 原始行数（含无效）
+        'temperature_raw': 'count',
         'name': lambda x: x.astype(str).mode().iloc[0] if len(x.astype(str).mode())>0 else x.astype(str).iloc[0]
     }
     grouped = df2.groupby('station_id').agg(agg_funcs).rename(columns={'temperature_raw': 'data_count'}).reset_index()
 
-    # 调整列名以满足 pipeline
     grouped = grouped[['station_id','lat','lon','elevation','temperature','data_count','name']]
 
-    # 添加备用列名（pipeline 的不同模块可能查 'latitude'/'longitude'）
     grouped['latitude'] = grouped['lat']
     grouped['longitude'] = grouped['lon']
 
     return grouped
 
 def main():
+    # ✅ argparse 现在在 main() 函数内初始化
     p = argparse.ArgumentParser(description="Prepare Guangdong merged cache for kriging_rf")
-    p.add_argument('--input', '-i', required=True, help='输入 parquet 或 CSV 文件路径')
+    p.add_argument('--input', '-i', required=False, default=None, help='输入文件（.parquet 或 .csv）；若不指定，将在 Guangzhou_data 自动查找')
     p.add_argument('--out', '-o', default='guangdong_merged_cache.parquet', help='输出 parquet 文件路径')
     p.add_argument('--force', '-f', action='store_true', help='覆盖已存在的输出文件')
     args = p.parse_args()
+
+    # ✅ 自动查找输入文件的逻辑也在这里
+    if args.input is None:
+        found = auto_find_input('Guangzhou_data')
+        if found is None:
+            print("No input specified and no files found in Guangzhou_data. 请用 --input 指定文件路径。")
+            sys.exit(2)
+        print("Auto-detected input:", found)
+        args.input = found
 
     if not os.path.exists(args.input):
         print("Input file not found:", args.input)
         sys.exit(2)
 
-    # 读取输入（支持 parquet/csv）
     ext = os.path.splitext(args.input)[1].lower()
     if ext in ('.parquet', '.pq'):
         df = pd.read_parquet(args.input)
     elif ext in ('.csv', '.txt'):
         df = pd.read_csv(args.input)
     else:
-        # 尝试自动判断 parquet first then csv
         try:
             df = pd.read_parquet(args.input)
         except Exception:
@@ -147,13 +160,11 @@ def main():
         print(f"Output file {args.out} exists. Use --force to overwrite.")
         sys.exit(0)
 
-    # 保存 parquet（保持压缩）
     try:
         grouped.to_parquet(args.out, index=False)
         print("Saved merged cache to:", args.out)
     except Exception as e:
         print("Failed to save parquet:", e)
-        # 退回保存 csv
         out_csv = os.path.splitext(args.out)[0] + ".csv"
         grouped.to_csv(out_csv, index=False)
         print("Saved fallback CSV to:", out_csv)
