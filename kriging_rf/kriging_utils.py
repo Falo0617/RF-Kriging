@@ -50,81 +50,108 @@ def perform_ok_interpolation(station_x, station_y, station_z, grid_res=50, vario
 def perform_ok_loo(station_x, station_y, station_z,
                    variogram_model='spherical',
                    neighbors=None,
-                   use_cache=False, cache_path='ok_loo.npz', overwrite=False):
+                   use_cache=False,
+                   cache_path='ok_loo.npz',
+                   overwrite=False):
     """
-    Leave-one-out Ordinary Kriging predictions at the station points.
-    - neighbors: 如果为 int，则对每个 LOO 拟合仅使用该点的最近 neighbors 个训练点（若 neighbors >= n-1 则使用所有）。
-    - use_cache: 如果 True，会尝试读取/写入 cache_path。cache 保存字段 'ok_loo' (numpy array)。
-    返回 numpy array (len == n)，缺失处为 np.nan。
+    对每个站点执行留一法普通克里金（LOO OK）预测。
+    若 neighbors 指定，则仅使用最近的 neighbors 个站点；否则使用全部站点。
+    结果可缓存为 .npz 文件。
     """
     station_x = np.asarray(station_x)
     station_y = np.asarray(station_y)
     station_z = np.asarray(station_z)
-
     n = len(station_x)
     if n == 0:
         return np.array([])
     if n <= 3:
-        warnings.warn("perform_ok_loo: too few stations (<=3), returning NaNs for LOO predictions.")
+        warnings.warn("perform_ok_loo: too few stations (<=3), returning NaNs")
         return np.full(n, np.nan)
 
-    # try cache
-    if use_cache and os.path.exists(cache_path) and not overwrite:
+    # 尝试从缓存加载
+    if use_cache and not overwrite and cache_path and os.path.exists(cache_path):
         try:
             data = np.load(cache_path, allow_pickle=True)
-            ok_loo = data.get('ok_loo', None)
-            if ok_loo is not None and len(ok_loo) == n:
-                return ok_loo
-        except Exception:
-            pass
+            cached = data.get('preds')
+            if cached is not None and len(cached) == n:
+                # 检查是否全部为 NaN（可能是之前失败的结果），若是则重新计算
+                if not np.all(np.isnan(cached)):
+                    print(f"[OK LOO] Loaded cached predictions from {cache_path}")
+                    return cached
+                else:
+                    print(f"[OK LOO] Cached file contains all NaN, recomputing...")
+            else:
+                print(f"[OK LOO] Cached file length mismatch or missing, recomputing...")
+        except Exception as e:
+            print(f"[OK LOO] Failed to load cache: {e}, recomputing...")
+
+    # ========== 坐标标准化 ==========
+    x_mean, x_std = station_x.mean(), station_x.std()
+    y_mean, y_std = station_y.mean(), station_y.std()
+    if x_std < 1e-10:
+        x_std = 1.0
+    if y_std < 1e-10:
+        y_std = 1.0
+    station_x_norm = (station_x - x_mean) / x_std
+    station_y_norm = (station_y - y_mean) / y_std
+    # ==============================
 
     preds = np.full(n, np.nan)
-    pts = np.column_stack([station_x, station_y])
+    pts = np.column_stack([station_x_norm, station_y_norm])
     tree = cKDTree(pts)
+
+    # 如果 neighbors 为 None 或大于 n-1，则使用全部其他点
+    if neighbors is None or neighbors >= n:
+        use_all = True
+        k_eff = n - 1
+    else:
+        use_all = False
+        k_eff = min(neighbors, n - 1)
 
     for i in range(n):
         try:
-            # select neighbor indices (exclude i)
-            if neighbors is None:
-                mask = np.ones(n, dtype=bool)
-                mask[i] = False
-                idxs = np.nonzero(mask)[0]
+            if use_all:
+                idxs = [j for j in range(n) if j != i]
             else:
-                # k nearest including self
-                k = min(max(1, int(neighbors) + 1), n)  # +1 to include self
-                dists, inds = tree.query(pts[i], k=k)
-                inds = np.atleast_1d(inds)
-                # remove self from inds
-                idxs = [int(j) for j in inds if int(j) != i]
-                if len(idxs) == 0:
-                    preds[i] = np.nan
+                # 查询最近 k_eff 个邻居（排除自身）
+                dists, idxs = tree.query(pts[i], k=k_eff + 1)
+                # idxs[0] 是自身，去掉
+                idxs = idxs[1:] if len(idxs) > 1 else []
+                if len(idxs) < 2:
+                    # 邻居太少，跳过
                     continue
 
+            # 用标准化坐标做克里金
             ok = OrdinaryKriging(
-                station_x[idxs], station_y[idxs], station_z[idxs],
+                station_x_norm[idxs],
+                station_y_norm[idxs],
+                station_z[idxs],
                 variogram_model=variogram_model,
                 verbose=False,
                 enable_plotting=False
             )
-            p, ss = ok.execute('points', np.array([station_x[i]]), np.array([station_y[i]]))
+            p, ss = ok.execute('points',
+                               np.array([station_x_norm[i]]),
+                               np.array([station_y_norm[i]]))
             preds[i] = float(p[0])
-        except Exception:
+        except Exception as e:
+            # 打印调试信息（可选）
+            # print(f"LOO failed for index {i}: {e}")
             preds[i] = np.nan
 
-    # write cache if requested
-    if use_cache:
+    # 缓存结果
+    if use_cache and cache_path:
         try:
-            np.savez_compressed(cache_path, ok_loo=preds)
-        except Exception:
-            pass
+            np.savez_compressed(cache_path, preds=preds)
+            print(f"[OK LOO] Saved predictions to {cache_path}")
+        except Exception as e:
+            print(f"[OK LOO] Failed to save cache: {e}")
 
     return preds
 
 
-def krige_residuals_to_points(train_x, train_y, train_resid, target_x, target_y, variogram_model='spherical'):
-    """
-    Krige training residuals to target points. On failure returns zeros array.
-    """
+def krige_residuals_to_points(train_x, train_y, train_resid, target_x, target_y,
+                              variogram_model='spherical'):
     train_x = np.asarray(train_x)
     train_y = np.asarray(train_y)
     train_resid = np.asarray(train_resid)
@@ -132,24 +159,49 @@ def krige_residuals_to_points(train_x, train_y, train_resid, target_x, target_y,
     target_y = np.asarray(target_y)
 
     if len(train_x) == 0:
-        warnings.warn("krige_residuals_to_points: no training points, returning zeros.")
         return np.zeros(len(target_x))
 
+    # ========== 新增：坐标标准化（基于训练集） ==========
+    x_mean, x_std = train_x.mean(), train_x.std()
+    y_mean, y_std = train_y.mean(), train_y.std()
+    if x_std < 1e-10:
+        x_std = 1.0
+    if y_std < 1e-10:
+        y_std = 1.0
+    train_x_norm = (train_x - x_mean) / x_std
+    train_y_norm = (train_y - y_mean) / y_std
+    target_x_norm = (target_x - x_mean) / x_std
+    target_y_norm = (target_y - y_mean) / y_std
+    # =================================================
+
     try:
-        rk = OrdinaryKriging(train_x, train_y, train_resid,
-                             variogram_model=variogram_model, verbose=False, enable_plotting=False)
-        res_pred, ss = rk.execute('points', target_x, target_y)
+        rk = OrdinaryKriging(
+            train_x_norm, train_y_norm, train_resid,  # 用标准化坐标
+            variogram_model=variogram_model,
+            verbose=False,
+            enable_plotting=False
+        )
+        res_pred, ss = rk.execute('points', target_x_norm, target_y_norm)  # 用标准化坐标
         return np.asarray(res_pred).ravel()
     except Exception as e:
         warnings.warn(f"krige_residuals_to_points failed, returning zeros. Error: {e}")
         return np.zeros(len(target_x))
 
 
-def krige_residuals_to_grid(train_x, train_y, train_resid, grid_x, grid_y, variogram_model='spherical'):
+def krige_residuals_to_grid(train_x, train_y, train_resid,
+                            grid_x, grid_y,
+                            variogram_model='spherical'):
     """
-    Krige training residuals onto a grid specified by grid_x (1d) and grid_y (1d).
-    Returns a 2D array shaped (len(grid_y), len(grid_x)) consistent with pykrige output.
-    On failure returns zeros with the same shape.
+    对残差进行克里金插值到网格（坐标标准化版）
+
+    参数:
+        train_x, train_y: 训练站点坐标（任意单位，建议为米）
+        train_resid: 训练站点残差值
+        grid_x, grid_y: 待插值网格坐标（一维数组，与训练坐标同单位）
+        variogram_model: 半变异函数模型（默认'spherical'）
+
+    返回:
+        残差网格（二维，形状为 len(grid_y) x len(grid_x)）
     """
     train_x = np.asarray(train_x)
     train_y = np.asarray(train_y)
@@ -157,19 +209,34 @@ def krige_residuals_to_grid(train_x, train_y, train_resid, grid_x, grid_y, vario
     grid_x = np.asarray(grid_x)
     grid_y = np.asarray(grid_y)
 
-    if len(train_x) == 0:
-        warnings.warn("krige_residuals_to_grid: no training points, returning zero grid.")
-        gx, gy = np.meshgrid(grid_x, grid_y)
-        return np.zeros_like(gx)
+    if len(train_x) == 0 or len(train_resid) == 0:
+        return np.zeros((len(grid_y), len(grid_x)))
+
+    # ---------- 坐标标准化（基于训练集） ----------
+    x_mean, x_std = train_x.mean(), train_x.std()
+    y_mean, y_std = train_y.mean(), train_y.std()
+    # 防止 std=0 的情况（所有点同 x 或同 y）
+    if x_std < 1e-10:
+        x_std = 1.0
+    if y_std < 1e-10:
+        y_std = 1.0
+
+    train_x_norm = (train_x - x_mean) / x_std
+    train_y_norm = (train_y - y_mean) / y_std
+    grid_x_norm = (grid_x - x_mean) / x_std
+    grid_y_norm = (grid_y - y_mean) / y_std
+    # -----------------------------------------
 
     try:
-        rk = OrdinaryKriging(train_x, train_y, train_resid,
-                             variogram_model=variogram_model, verbose=False, enable_plotting=False)
-        res_grid, ss = rk.execute('grid', grid_x, grid_y)
-        res_grid = np.asarray(res_grid)
-        res_grid = np.nan_to_num(res_grid, nan=0.0)
-        return res_grid
+        rk = OrdinaryKriging(
+            train_x_norm, train_y_norm, train_resid,
+            variogram_model=variogram_model,
+            verbose=False,
+            enable_plotting=False
+        )
+        # 执行网格插值，传入标准化后的网格坐标
+        z_grid, ss = rk.execute('grid', grid_x_norm, grid_y_norm)
+        return z_grid
     except Exception as e:
-        warnings.warn(f"krige_residuals_to_grid failed, returning zero grid. Error: {e}")
-        gx, gy = np.meshgrid(grid_x, grid_y)
-        return np.zeros_like(gx)
+        warnings.warn(f"krige_residuals_to_grid failed, returning zeros. Error: {e}")
+        return np.zeros((len(grid_y), len(grid_x)))
