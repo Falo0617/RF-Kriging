@@ -6,13 +6,17 @@ GSOD 多站点数据整理脚本 (方案 A：按最新日期筛选)
 - 读取多个 GSOD 站点 CSV 文件（每个文件一个站点，可能包含多日期）
 - 只保留最新日期的数据
 - 按站点聚合
-- 清洗异常值
+- 清洗异常值（温度 > 60°C 或 < -50°C 视为异常）
 - 输出为 parquet 格式（供 run_kriging.py 使用）
 
+支持目标变量选择：温度（temperature）或露点温度（dew_point）
+
 使用示例：
-    python run_prepare_gsod.py                          # 使用默认路径
+    python run_prepare_gsod.py                          # 使用默认路径，直接覆盖
     python run_prepare_gsod.py --input-dir ./other_data # 指定自定义路径
-    python run_prepare_gsod.py --force --no-latest-date # 保留所有日期数据
+    python run_prepare_gsod.py --no-latest-date         # 保留所有日期数据
+    python run_prepare_gsod.py --target dew_point       # 使用露点温度作为主目标
+    python run_prepare_gsod.py --out my_data.parquet    # 指定输出文件
 """
 import argparse
 import os
@@ -37,6 +41,13 @@ DEFAULT_TEMP_UNIT = 'F'
 # 是否只保留最新日期的数据（推荐 True）
 DEFAULT_USE_LATEST_DATE = True
 
+# 默认目标变量：'temperature' 或 'dew_point'
+DEFAULT_TARGET = 'temperature'
+
+# 异常值过滤阈值（摄氏度）
+DEFAULT_TEMP_MIN = -50.0   # 低于此值视为异常
+DEFAULT_TEMP_MAX = 60.0    # 高于此值视为异常（GSOD 全球最高温约 56.7°C）
+
 
 # ============================================================================
 # ============================================================================
@@ -52,21 +63,24 @@ def main():
         epilog="""
 示例：
   # 使用默认路径，只保留最新日期（推荐）
-  python run_prepare_gsod.py --force
+  python run_prepare_gsod.py
 
   # 指定自定义输入目录
-  python run_prepare_gsod.py --input-dir /path/to/gsod/files --force
+  python run_prepare_gsod.py --input-dir /path/to/gsod/files
 
   # 保留所有日期数据（会得到更多样本）
-  python run_prepare_gsod.py --no-latest-date --force
+  python run_prepare_gsod.py --no-latest-date
+
+  # 使用露点温度作为目标变量
+  python run_prepare_gsod.py --target dew_point --out gsod_dewp.parquet
 
   # 完整示例
   python run_prepare_gsod.py \\
     --input-dir ./GSOD_data \\
     --pattern "station_*.csv" \\
     --temp-unit F \\
+    --target dew_point \\
     --out gsod_final.parquet \\
-    --force \\
     --use-latest-date
         """
     )
@@ -91,15 +105,16 @@ def main():
     )
 
     parser.add_argument(
-        '--out', '-o',
-        default=DEFAULT_OUTPUT_FILE,
-        help=f'输出 parquet 文件路径 (默认: {DEFAULT_OUTPUT_FILE})'
+        '--target',
+        choices=['temperature', 'dew_point'],
+        default=DEFAULT_TARGET,
+        help=f'目标变量：temperature（温度）或 dew_point（露点温度）(默认: {DEFAULT_TARGET})'
     )
 
     parser.add_argument(
-        '--force', '-f',
-        action='store_true',
-        help='覆盖已存在的输出文件'
+        '--out', '-o',
+        default=DEFAULT_OUTPUT_FILE,
+        help=f'输出 parquet 文件路径 (默认: {DEFAULT_OUTPUT_FILE})'
     )
 
     parser.add_argument(
@@ -116,6 +131,20 @@ def main():
         help='保留所有日期的数据（不筛选）'
     )
 
+    # 异常值过滤参数
+    parser.add_argument(
+        '--temp-min',
+        type=float,
+        default=DEFAULT_TEMP_MIN,
+        help=f'温度最小阈值（摄氏度），低于此值视为异常 (默认: {DEFAULT_TEMP_MIN})'
+    )
+    parser.add_argument(
+        '--temp-max',
+        type=float,
+        default=DEFAULT_TEMP_MAX,
+        help=f'温度最大阈值（摄氏度），高于此值视为异常 (默认: {DEFAULT_TEMP_MAX})'
+    )
+
     args = parser.parse_args()
 
     print("=" * 70)
@@ -125,8 +154,10 @@ def main():
     print(f"  输入目录：{args.input_dir}")
     print(f"  文件模式：{args.pattern}")
     print(f"  温度单位：{args.temp_unit}")
+    print(f"  目标变量：{args.target}")
     print(f"  只保留最新日期：{args.use_latest_date}")
     print(f"  输出文件：{args.out}")
+    print(f"  温度过滤范围：{args.temp_min} ~ {args.temp_max}°C")
 
     # 检查输入目录
     if not os.path.isdir(args.input_dir):
@@ -142,12 +173,15 @@ def main():
         print(f"\n📂 从目录读取 GSOD CSV 文件...")
         df = read_gsod_directory(args.input_dir, pattern=args.pattern)
 
-        print(f"\n🔄 数据处理中（温度单位：{args.temp_unit}）...")
+        print(f"\n🔄 数据处理中（温度单位：{args.temp_unit}，目标：{args.target}）...")
         grouped = prepare_gsod(
             df,
             temp_unit=args.temp_unit,
             drop_nan_temp=True,
-            use_latest_date=args.use_latest_date
+            use_latest_date=args.use_latest_date,
+            target_col=args.target,
+            temp_min=args.temp_min,
+            temp_max=args.temp_max
         )
 
         print(f"\n✅ 成功聚合至 {len(grouped)} 个站点")
@@ -158,16 +192,23 @@ def main():
         print(f"\n📈 数据统计：")
         print(f"  站点总数：{len(grouped)}")
         print(f"  温度范围：{grouped['temperature'].min():.2f}°C ~ {grouped['temperature'].max():.2f}°C")
-        print(f"  平均温度：{grouped['temperature'].mean():.2f}°C")
+        if 'dew_point' in grouped.columns and not grouped['dew_point'].isna().all():
+            print(f"  露点温度范围：{grouped['dew_point'].min():.2f}°C ~ {grouped['dew_point'].max():.2f}°C")
         print(f"  海拔范围：{grouped['elevation'].min():.0f}m ~ {grouped['elevation'].max():.0f}m")
 
-        # 检查输出文件是否存在
-        if os.path.exists(args.out) and not args.force:
-            print(f"\n❌ 输出文件已存在：{args.out}")
-            print(f"   使用 --force 覆盖，或修改 --out 参数")
-            sys.exit(0)
+        # 默认覆盖
+        if os.path.exists(args.out):
+            print(f"\n⚠️  输出文件已存在，将覆盖：{args.out}")
 
-        # 保存为 parquet
+        # ========== 关键修复：确保列类型正确 ==========
+        # station_id 可能包含字母，强制转为字符串
+        grouped['station_id'] = grouped['station_id'].astype(str)
+        # name 列可能包含非字符串
+        if 'name' in grouped.columns:
+            grouped['name'] = grouped['name'].astype(str)
+        # =============================================
+
+        # 保存为 parquet（优先）
         try:
             import pandas as pd
             grouped.to_parquet(args.out, index=False, compression='snappy')
@@ -175,7 +216,7 @@ def main():
             print(f"\n✅ 已保存合并缓存到：{args.out}")
             print(f"   文件大小：{file_size_mb:.2f} MB")
             print(f"\n💡 后续使用 kriging 流程：")
-            print(f"   python run_kriging.py --cache {args.out} --n-splits 5 --ok-neighbors 15")
+            print(f"   python run_kriging.py --cache {args.out} --target {args.target} --n-splits 5 --ok-neighbors 15")
 
         except Exception as e:
             print(f"\n⚠️  Parquet 保存失败：{e}")
