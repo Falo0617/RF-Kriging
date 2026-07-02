@@ -1,348 +1,172 @@
 """
-GSOD (Global Summary of the Day) 数据处理工具
-
-GSOD 是 NOAA/NCEI 提供的全球日尺度气象数据，包括温度、风速、降水等。
-本模块用于：
-1. 读取多个站点的 CSV 文件
-2. 统一列名和数据格式
-3. 按站点聚合
-4. 清洗异常值
+GSOD 数据处理工具函数
+支持读取多个站点 CSV 文件，聚合站点数据，支持温度（TEMP）和露点温度（DEWP）两种目标变量。
+支持异常值过滤（temp_min / temp_max）。
 """
 import os
 import glob
-import pandas as pd
 import numpy as np
-from pathlib import Path
-
-SENTINEL_VALUES = {999.9, 9999.9, 999017, 999999, 99999, 9999}
+import pandas as pd
 
 
-def find_col(df, candidates):
-    """在 df 中查找第一匹配的列名（大小写不敏感）。返回列名或 None"""
-    lower_map = {c.lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand.lower() in lower_map:
-            return lower_map[cand.lower()]
-    return None
-
-
-def sanitize_temp(x):
+def read_gsod_directory(directory, pattern='*.csv'):
     """
-    清洗温度数据
-    - 检查哨兵值
-    - 检查合理范围（-60 to 60°C）
+    读取目录下所有 GSOD CSV 文件，返回一个包含所有站点原始数据的 DataFrame。
+
+    从每个 CSV 中提取以下列：
+        STATION, DATE, LATITUDE, LONGITUDE, ELEVATION, TEMP, DEWP, NAME
+
+    参数:
+        directory: 包含 CSV 文件的目录路径
+        pattern: 文件匹配模式 (默认 '*.csv')
+
+    返回:
+        pandas.DataFrame: 合并后的原始数据
     """
-    try:
-        if pd.isna(x):
-            return np.nan
-        xv = float(x)
-        # 检查哨兵值（整数和浮点）
-        if xv in SENTINEL_VALUES or int(xv) in SENTINEL_VALUES:
-            return np.nan
-        # GSOD 温度通常是 °F 或 °C
-        if xv < -60 or xv > 60:
-            return np.nan
-        return xv
-    except Exception:
-        return np.nan
+    all_dfs = []
+    for filepath in glob.glob(os.path.join(directory, pattern)):
+        try:
+            df = pd.read_csv(filepath, encoding='utf-8', low_memory=False)
+            # 检查必要列
+            required = ['STATION', 'DATE', 'LATITUDE', 'LONGITUDE', 'ELEVATION', 'TEMP']
+            if not all(col in df.columns for col in required):
+                continue
+            # 提取需要的列
+            cols = ['STATION', 'DATE', 'LATITUDE', 'LONGITUDE', 'ELEVATION', 'TEMP']
+            if 'DEWP' in df.columns:
+                cols.append('DEWP')
+            else:
+                df['DEWP'] = np.nan
+            if 'NAME' in df.columns:
+                cols.append('NAME')
+            else:
+                df['NAME'] = ''
+
+            df_sub = df[cols].copy()
+            df_sub['source_file'] = os.path.basename(filepath)
+            all_dfs.append(df_sub)
+
+        except Exception as e:
+            print(f"Warning: failed to read {filepath}: {e}")
+            continue
+
+    if not all_dfs:
+        raise ValueError("No valid GSOD CSV files found in directory: {}".format(directory))
+    return pd.concat(all_dfs, ignore_index=True)
 
 
-def sanitize_elev(x):
-    """清洗海拔数据"""
-    try:
-        if pd.isna(x):
-            return np.nan
-        xv = float(x)
-        if xv in SENTINEL_VALUES or int(xv) in SENTINEL_VALUES:
-            return np.nan
-        if xv < -500 or xv > 10000:
-            return np.nan
-        return xv
-    except Exception:
-        return np.nan
-
-
-def read_gsod_csv(filepath):
+def prepare_gsod(df, temp_unit='F', drop_nan_temp=True, use_latest_date=True, target_col='temperature',
+                 temp_min=-50.0, temp_max=60.0):
     """
-    读取单个 GSOD CSV 文件
+    聚合站点数据，每个站点一行。
 
-    GSOD 标准列名（可能有变化）：
-    - STN / USAF: 站点 ID
-    - WBAN: WBAN ID
-    - YEARMODA: 日期
-    - TEMP: 平均温度 (°F)
-    - LAT / LON: 经纬度
-    - ELEV: 海拔
-    - STNNAME: 站点名称
+    参数:
+        df: pandas.DataFrame，来自 read_gsod_directory 的原始数据
+        temp_unit: 输入温度单位，'F' 或 'C'，GSOD 标准为华氏度（'F'）
+        drop_nan_temp: 是否删除 TEMP 缺失的行
+        use_latest_date: True 则每个站点只保留最新日期的记录；False 则保留所有记录的平均值
+        target_col: 'temperature' 或 'dew_point'，指定主目标列
+        temp_min: 温度最小阈值（摄氏度），低于此值视为异常，默认 -50°C
+        temp_max: 温度最大阈值（摄氏度），高于此值视为异常，默认 60°C
 
-    返回: DataFrame 或 None（如果读取失败）
+    返回:
+        pandas.DataFrame: 包含列 station_id, latitude, longitude, elevation,
+                          temperature, dew_point, name
     """
-    try:
-        df = pd.read_csv(filepath)
-        return df
-    except Exception as e:
-        print(f"Warning: Failed to read {filepath}: {e}")
-        return None
-
-
-def read_gsod_directory(directory, pattern="*.csv"):
-    """
-    读取目录下所有 GSOD CSV 文件并合并
-
-    Args:
-        directory: GSOD CSV 文件所在目录
-        pattern: 文件匹配模式，默认 "*.csv"
-
-    Returns:
-        合并后的 DataFrame
-    """
-    csv_files = glob.glob(os.path.join(directory, pattern))
-
-    if not csv_files:
-        raise ValueError(f"No CSV files found in {directory} matching pattern {pattern}")
-
-    print(f"Found {len(csv_files)} CSV files in {directory}")
-
-    dfs = []
-    for fpath in csv_files:
-        df = read_gsod_csv(fpath)
-        if df is not None:
-            dfs.append(df)
-            print(f"  ✓ Loaded {os.path.basename(fpath)} ({len(df)} rows)")
-
-    if not dfs:
-        raise ValueError("No GSOD files could be loaded")
-
-    combined = pd.concat(dfs, ignore_index=True)
-    print(f"\nCombined: {len(combined)} total records from {len(dfs)} files")
-    print(f"Columns found: {list(combined.columns)}")
-
-    return combined
-
-
-def prepare_gsod(df: pd.DataFrame, temp_unit='F', drop_nan_temp=True, use_latest_date=True) -> pd.DataFrame:
-    """
-    处理 GSOD 数据：标准化列名、清洗数据、聚合按站点
-
-    Args:
-        df: 合并的 GSOD DataFrame
-        temp_unit: 温度单位 'F'(华氏) 或 'C'(摄氏)，默认 'F'（GSOD 标准）
-        drop_nan_temp: 是否删除温度为 NaN 的记录（默认 True，推荐）
-        use_latest_date: 是否只保留最新日期的数据（默认 True）🔑 新增
-
-    Returns:
-        标准化后的 DataFrame（每行一个站点）
-    """
-    # 尝试识别各种列名变体
-    col_station = find_col(df, ['STN', 'USAF', 'station_id', 'STATION', 'StationId'])
-    col_wban = find_col(df, ['WBAN', 'wban', 'Wban'])
-    col_temp = find_col(df, ['TEMP', 'temperature', 'TEMPERATURE', 'temp', 'MEAN', 'Mean'])
-    col_lat = find_col(df, ['LAT', 'lat', 'latitude', 'LATITUDE'])
-    col_lon = find_col(df, ['LON', 'lon', 'longitude', 'LONGITUDE'])
-    col_elev = find_col(df, ['ELEV', 'elevation', 'ELEVATION', 'elev', 'altitude', 'ALT'])
-    col_name = find_col(df, ['STNNAME', 'station_name', 'NAME', 'name', 'StationName', 'STNNAME'])
-    col_date = find_col(df, ['YEARMODA', 'DATE', 'date', 'Year', 'YEAR'])  # 🔑 新增
-
-    print(f"\n列名检测结果：")
-    print(f"  Station ID: {col_station}")
-    print(f"  Temperature: {col_temp}")
-    print(f"  Latitude: {col_lat}")
-    print(f"  Longitude: {col_lon}")
-    print(f"  Elevation: {col_elev}")
-    print(f"  Station Name: {col_name}")
-    print(f"  Date: {col_date}")  # 🔑 新增
-
-    # 验证必要列
-    if col_lat is None or col_lon is None:
-        raise ValueError(f"Latitude/Longitude columns not found. Found columns: {', '.join(df.columns)}")
-
-    if col_station is None and col_wban is None:
-        raise ValueError(f"Station ID columns (STN/USAF or WBAN) not found. Found columns: {', '.join(df.columns)}")
-
-    if col_temp is None:
-        raise ValueError(f"Temperature column not found. Found columns: {', '.join(df.columns)}")
-
-    # 🔑 新增：关键步骤 - 按最新日期筛选
-    if use_latest_date and col_date is not None:
-        print(f"\n📅 日期列检测到，按最新日期筛选...")
-        latest_date = df[col_date].max()
-        print(f"   最新日期：{latest_date}")
-        df_before = len(df)
-        df = df[df[col_date] == latest_date].copy()
-        df_after = len(df)
-        print(f"   筛选前：{df_before} 条记录")
-        print(f"   筛选后：{df_after} 条记录 (删除 {df_before - df_after} 条)")
-
-    # 创建标准数据框
-    df2 = pd.DataFrame()
-
-    # 组合 station_id（优先用 STN，否则用 WBAN）
-    if col_station is not None and col_wban is not None:
-        df2['station_id'] = df[col_station].astype(str) + '_' + df[col_wban].astype(str)
-    elif col_station is not None:
-        df2['station_id'] = df[col_station].astype(str)
-    else:
-        df2['station_id'] = df[col_wban].astype(str)
-
-    # 坐标和海拔
-    df2['lat'] = pd.to_numeric(df[col_lat], errors='coerce')
-    df2['lon'] = pd.to_numeric(df[col_lon], errors='coerce')
-
-    if col_elev is not None:
-        df2['elevation'] = df[col_elev].apply(sanitize_elev)
-    else:
-        df2['elevation'] = np.nan
+    df = df.copy()
 
     # 温度处理
-    df2['temperature_raw'] = df[col_temp]
-    df2['temperature'] = df[col_temp].apply(sanitize_temp)
-
-    # 华氏转摄氏（如果需要）
-    if temp_unit == 'F':
-        valid = ~np.isnan(df2['temperature'])
-        print(f"\n华氏 → 摄氏转换: {valid.sum()} 条记录")
-        df2.loc[valid, 'temperature'] = (df2.loc[valid, 'temperature'] - 32) * 5 / 9
-
-    # 站点名称
-    if col_name is not None:
-        df2['name'] = df[col_name].astype(str)
+    # GSOD 中 TEMP 存储为 0.1°F (即华氏度 × 10)
+    if 'TEMP' in df.columns:
+        # 除以 10 得到华氏度
+        df['TEMP_F'] = df['TEMP'] / 10.0
+        # 转换为摄氏度
+        if temp_unit.upper() == 'F':
+            df['TEMP_C'] = (df['TEMP_F'] - 32) * 5 / 9
+        else:
+            df['TEMP_C'] = df['TEMP_F']  # 如果已经是摄氏度，直接使用
     else:
-        df2['name'] = df2['station_id']
+        df['TEMP_C'] = np.nan
 
-    print(f"\n数据清洗前:")
-    print(f"  总记录数: {len(df2)}")
-    print(f"  温度 NaN 数: {df2['temperature'].isna().sum()}")
-    print(f"  经纬 NaN 数: {(df2['lat'].isna() | df2['lon'].isna()).sum()}")
+    # 露点温度处理（DEWP 同样为 0.1°F）
+    if 'DEWP' in df.columns:
+        df['DEWP_F'] = df['DEWP'] / 10.0
+        if temp_unit.upper() == 'F':
+            df['DEWP_C'] = (df['DEWP_F'] - 32) * 5 / 9
+        else:
+            df['DEWP_C'] = df['DEWP_F']
+    else:
+        df['DEWP_C'] = np.nan
 
-    # 🔑 关键：删除温度为 NaN 的记录
+    # 日期处理
+    df['DATE'] = pd.to_datetime(df['DATE'], errors='coerce')
+    if use_latest_date:
+        # 按站点分组，取最大日期对应的行
+        idx = df.groupby('STATION')['DATE'].idxmax()
+        df = df.loc[idx].reset_index(drop=True)
+    else:
+        # 按站点聚合平均值
+        numeric_cols = ['LATITUDE', 'LONGITUDE', 'ELEVATION', 'TEMP_C', 'DEWP_C']
+        agg_dict = {col: 'mean' for col in numeric_cols if col in df.columns}
+        if 'NAME' in df.columns:
+            agg_dict['NAME'] = lambda x: x.iloc[0] if len(x) > 0 else ''
+        df = df.groupby('STATION').agg(agg_dict).reset_index()
+
+    # 删除温度缺失的行（可选）
     if drop_nan_temp:
-        initial_count = len(df2)
-        df2 = df2.dropna(subset=['temperature'])
-        removed_count = initial_count - len(df2)
-        if removed_count > 0:  # 🔑 新增条件判断
-            print(f"\n删除温度 NaN 记录: {removed_count} 条 ({removed_count / initial_count * 100:.1f}%)")
+        df = df.dropna(subset=['TEMP_C'])
 
-    # 删除经纬缺失的行
-    df2 = df2.dropna(subset=['lat', 'lon']).reset_index(drop=True)
+    # 重命名列
+    rename_map = {
+        'STATION': 'station_id',
+        'LATITUDE': 'latitude',
+        'LONGITUDE': 'longitude',
+        'ELEVATION': 'elevation',
+        'TEMP_C': 'temperature',
+        'DEWP_C': 'dew_point',
+        'NAME': 'name'
+    }
+    df = df.rename(columns=rename_map)
 
-    if len(df2) == 0:
-        raise ValueError("No valid station coordinates after filtering")
+    # 确保 dew_point 列存在（若没有则补 NaN）
+    if 'dew_point' not in df.columns:
+        df['dew_point'] = np.nan
 
-    print(f"\n数据清洗后: {len(df2)} 条有效记录")
+    # 根据 target_col 决定主列
+    # 如果 target_col 是 dew_point，则将 dew_point 的值赋给 temperature（使下游兼容）
+    if target_col == 'dew_point':
+        if 'dew_point' in df.columns and not df['dew_point'].isna().all():
+            df['temperature'] = df['dew_point']
+        else:
+            # 若 dew_point 全为 NaN，则使用 temperature 列（如果存在）
+            pass
 
-    # 按 station_id 聚合
-    unique_stations = df2['station_id'].nunique()  # 🔑 新增
-    if len(df2) > unique_stations:  # 🔑 新增条件判断
-        print(f"\n🔄 按站点聚合（{len(df2)} 条记录 → {unique_stations} 个站点）...")  # 🔑 新增
-        agg_funcs = {
-            'lat': 'median',
-            'lon': 'median',
-            'elevation': lambda x: np.nanmedian(x.values) if np.any(~np.isnan(x.values)) else np.nan,
-            'temperature': lambda x: np.nanmean(x.values) if np.any(~np.isnan(x.values)) else np.nan,
-            'temperature_raw': 'count',
-            'name': lambda x: x.astype(str).mode()[0] if len(x.astype(str).mode()) > 0 else x.astype(str).iloc[0]
-        }
+    # 确保必要的列存在
+    required_cols = ['station_id', 'latitude', 'longitude', 'elevation', 'temperature']
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = np.nan
 
-        grouped = df2.groupby('station_id', as_index=False).agg(agg_funcs)
-        grouped = grouped.rename(columns={'temperature_raw': 'data_count'})
-    else:  # 🔑 新增
-        grouped = df2.copy()  # 🔑 新增
-        grouped['data_count'] = 1  # 🔑 新增
+    # 处理 name 列
+    if 'name' not in df.columns:
+        df['name'] = ''
 
-    # 标准列顺序
-    grouped = grouped[['station_id', 'lat', 'lon', 'elevation', 'temperature', 'data_count', 'name']]
+    # ========== 新增：异常值过滤 ==========
+    before = len(df)
 
-    # 再次检查温度 NaN
-    nan_temp_count = grouped['temperature'].isna().sum()
-    if nan_temp_count > 0:
-        print(f"\n⚠️  警告：聚合后仍有 {nan_temp_count} 个站点的温度为 NaN")
-        print(f"   这些站点将在建模时被跳过")
-        grouped = grouped.dropna(subset=['temperature'])
+    # 过滤 temperature 列
+    if 'temperature' in df.columns:
+        df = df[(df['temperature'] >= temp_min) & (df['temperature'] <= temp_max)]
 
-    # 添加备用列名（兼容其他模块）
-    grouped['latitude'] = grouped['lat']
-    grouped['longitude'] = grouped['lon']
+    # 过滤 dew_point 列（如果存在且非空）
+    if 'dew_point' in df.columns and not df['dew_point'].isna().all():
+        df = df[(df['dew_point'] >= temp_min) & (df['dew_point'] <= temp_max)]
 
-    print(f"\n✅ 最终聚合结果：{len(grouped)} 个站点")  # 🔑 新增
+    after = len(df)
+    if after < before:
+        print(f"  过滤掉 {before - after} 个异常站点（温度范围 {temp_min}~{temp_max}°C）")
+    # =====================================
 
-    return grouped
-
-
-def main():
-    """命令行接口"""
-    import argparse
-
-    p = argparse.ArgumentParser(
-        description="Prepare GSOD (Global Summary of the Day) station data for kriging_rf pipeline"
-    )
-    p.add_argument(
-        '--input-dir', '-d',
-        required=True,
-        help='GSOD CSV 文件所在目录'
-    )
-    p.add_argument(
-        '--pattern', '-p',
-        default='*.csv',
-        help='文件匹配模式（默认 *.csv）'
-    )
-    p.add_argument(
-        '--temp-unit',
-        choices=['F', 'C'],
-        default='F',
-        help='温度单位：F(华氏度，GSOD默认) 或 C(摄氏度)'
-    )
-    p.add_argument(
-        '--out', '-o',
-        default='gsod_merged_cache.parquet',
-        help='输出 parquet 文件路径'
-    )
-    p.add_argument(
-        '--force', '-f',
-        action='store_true',
-        help='覆盖已存在的输出文件'
-    )
-
-    args = p.parse_args()
-
-    # 检查输入目录
-    if not os.path.isdir(args.input_dir):
-        print(f"Input directory not found: {args.input_dir}")
-        return
-
-    try:
-        # 读取所有 GSOD CSV
-        print(f"\nReading GSOD CSV files from: {args.input_dir}")
-        df = read_gsod_directory(args.input_dir, pattern=args.pattern)
-
-        print(f"\nPreparing data (temperature unit: {args.temp_unit})...")
-        grouped = prepare_gsod(df, temp_unit=args.temp_unit, drop_nan_temp=True)
-
-        print(f"\n✓ Aggregated to {len(grouped)} stations")
-        print("\nExample rows:")
-        print(grouped.head(10).to_string(index=False))
-
-        # 检查输出文件是否存在
-        if os.path.exists(args.out) and not args.force:
-            print(f"\n✗ Output file {args.out} already exists. Use --force to overwrite.")
-            return
-
-        # 保存为 parquet
-        try:
-            grouped.to_parquet(args.out, index=False, compression='snappy')
-            print(f"\n✓ Saved merged cache to: {args.out}")
-            print(f"  File size: {os.path.getsize(args.out) / (1024**2):.2f} MB")
-        except Exception as e:
-            print(f"\n✗ Failed to save parquet: {e}")
-            # 退回保存为 CSV
-            out_csv = os.path.splitext(args.out)[0] + ".csv"
-            grouped.to_csv(out_csv, index=False)
-            print(f"✓ Saved fallback CSV to: {out_csv}")
-
-    except Exception as e:
-        print(f"\n✗ Error: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-if __name__ == '__main__':
-    main()
+    # 选择最终输出的列（保持顺序）
+    out_cols = ['station_id', 'latitude', 'longitude', 'elevation', 'temperature', 'dew_point', 'name']
+    return df[out_cols].copy()

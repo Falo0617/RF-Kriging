@@ -19,7 +19,7 @@ def _pick_column(df, candidates, default=None):
     return default
 
 
-def stations_to_xy(df_stations, lon_center=None, lat_center=None):
+def stations_to_xy(df_stations, lon_center=None, lat_center=None, target_col=None):
     """
     将站点表（可能含多种列名变体）标准化并生成 x,y (米) 投影坐标。
     输入 df_stations 常见列（任选）:
@@ -27,10 +27,13 @@ def stations_to_xy(df_stations, lon_center=None, lat_center=None):
       - latitude: 'lat' or 'latitude'
       - longitude: 'lon' or 'longitude'
       - elevation: 'elev1' or 'elevation' or 'elev'
-      - temperature: 'TEM' or 'temperature' or 'temp'
+      - temperature: 'TEM' or 'temperature' or 'temp' (若 target_col 未指定)
       - name: 'name' (optional)
+    参数 target_col: 可选，指定目标变量列名（如 'DEWP' 用于露点温度）。
+                     若指定，则优先使用该列作为温度数据；否则按默认顺序查找。
     返回 (df_out, lon_center, lat_center)：
-      df_out 包含至少这些列: ['station_id','lat','lon','elevation','temperature','name','x','y']
+      df_out 包含至少这些列: ['station_id','name','lat','lon','x','y','elevation','temperature']
+      其中 'temperature' 列的内容来自 target_col（如果指定）或默认温度列。
     """
     df = df_stations.copy()
 
@@ -39,8 +42,19 @@ def stations_to_xy(df_stations, lon_center=None, lat_center=None):
     col_lat = _pick_column(df, ['lat', 'latitude'], default=None)
     col_lon = _pick_column(df, ['lon', 'longitude'], default=None)
     col_elev = _pick_column(df, ['elev1', 'elevation', 'elev'], default=None)
-    col_temp = _pick_column(df, ['TEM', 'temperature', 'temp'], default=None)
     col_name = _pick_column(df, ['name', 'station_name'], default=None)
+
+    # Detect temperature column: if target_col specified, use it directly; else search common names
+    if target_col is not None:
+        if target_col in df.columns:
+            col_temp = target_col
+        else:
+            # fallback to default search if specified column not found
+            col_temp = _pick_column(df, ['TEM', 'temperature', 'temp'], default=None)
+            if col_temp is None:
+                raise KeyError(f"Specified target column '{target_col}' not found and no default temperature column found.")
+    else:
+        col_temp = _pick_column(df, ['TEM', 'temperature', 'temp'], default=None)
 
     if col_lat is None or col_lon is None:
         raise KeyError("stations_to_xy: input dataframe must contain latitude and longitude (lat/lon or latitude/longitude).")
@@ -51,6 +65,7 @@ def stations_to_xy(df_stations, lon_center=None, lat_center=None):
     out['lat'] = df[col_lat].astype(float)
     out['lon'] = df[col_lon].astype(float)
     out['elevation'] = df[col_elev].astype(float) if col_elev is not None else np.zeros(len(df))
+    # 温度数据：无论源列是什么，都存入 'temperature' 列
     out['temperature'] = df[col_temp].astype(float) if col_temp is not None else np.full(len(df), np.nan)
     out['name'] = df[col_name] if col_name is not None else out['station_id']
 
